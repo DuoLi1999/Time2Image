@@ -35,21 +35,22 @@ def read_row(line_number, filepath):
     return None, None  
 
 def read_tsv(dir_data, num_classes):
-    data =[]
+    data = []
     label = []
     with open(dir_data, newline='') as f:
         reader = csv.reader(f, delimiter='\t')
         for row in reader:
-            float_list = [float(item) for item in row]
-            data.append(float_list[1:])
-            label.append(float_list[0])
+            float_row = list(map(float, row))  # Using map for conversion
+            data.append(float_row[1:])
+            label.append(float_row[0])
         speed = np.array(data)
         label = label_encoder.fit_transform(label)
-        verify_0 = sorted(set(label))==list(range(num_classes))
-        if verify_0:
-            return speed,label
+        verify = sorted(set(label)) == list(range(num_classes))
+        if verify:
+            return speed, label
         else:
-            assert('!!!')     
+            raise ValueError('Label verification failed')  # Changed assertion to ValueError
+
 
 def get_new_seq(data, size=196):
     '''
@@ -106,7 +107,8 @@ def get_gmat(config, m=0, n=0, std=1):
 def main(args):
     config = get_config(args.image_size, args.patch_size)
     name, num_classes = read_row(args.index, args.name_class_path)
-    data_dir = os.path.join(os.path.join(args.data_path,name),name+'_TRAIN.tsv'), os.path.join(os.path.join(args.data_path,name),name+'_TEST.tsv')
+    data_dir = [os.path.join(args.data_path, name, f"{name}_TRAIN.tsv"),
+                os.path.join(args.data_path, name, f"{name}_TEST.tsv")]
     data_train, label_train= read_tsv(data_dir[0], num_classes)
     data_test, label_test  = read_tsv(data_dir[1], num_classes)
 
@@ -125,11 +127,11 @@ def main(args):
     for i in tqdm(range(len(data_train))):
         img = Image.fromarray((data_train[i]).astype(np.uint8), mode='L')
         img.save(os.path.join(train_dir, str(label_train[i]))+'/'+str(i)+'.JPEG')
-    print('Processing' + name +'training dataset done!')    
+    print('Processing ' + name +' training dataset done!')    
     for i in tqdm(range(len(data_test))):
         img = Image.fromarray((data_test[i]).astype(np.uint8), mode='L')
         img.save(os.path.join(test_dir, str(label_test[i]))+'/'+str(i)+'.JPEG')    
-    print('Processing' + name +'testing dataset done!')    
+    print('Processing ' + name +' testing dataset done!')    
 
 if __name__ == "__main__":
 
