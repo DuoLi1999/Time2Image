@@ -136,7 +136,7 @@ def main(args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name-class-path", type=str, default='/home/ld/Time2Image/utils/name_class.txt')
+    parser.add_argument("--name-class-path", type=str, default='utils/name_class.txt')
     parser.add_argument("--data-path", type=str, default='UCRArchive_2018')
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--image-size", type=int, choices=[224, 384, 512], default=224)

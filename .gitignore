@@ -1,0 +1,6 @@
+results/
+UCRArchive_2018/
+utils/mat_pos.json
+utils/radius.json
+run.sh
+train.sh
