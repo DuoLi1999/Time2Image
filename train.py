@@ -1,518 +1,228 @@
-# coding=utf-8
-#python train.py --name GAD_ECG5000 --device cuda:0 --classes
-from __future__ import absolute_import, division, print_function
-import logging
-import argparse
-import os
-import random
-import numpy as np
-from sklearn.metrics import classification_report
-
-from datetime import timedelta, datetime
-
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
-# from torch.cuda.amp import autocast, GradScaler
-
-from tqdm import tqdm
-from torch.nn.utils import clip_grad
-
-from torch.optim.lr_scheduler import CyclicLR, OneCycleLR
-
-# from apex import amp
-# from apex.parallel import DistributedDataParallel as DDP
-
-# from models.modeling import VisionTransformer, CONFIGS
-from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
-from utils.dist_util import get_world_size
-
-import csv
-
-
-class CSVLogger():
-    def __init__(self, args, fieldnames, filename='log.csv'):
-
-        self.filename = filename
-        self.csv_file = open(filename, 'w')
-
-        # Write model configuration at top of csv
-        writer = csv.writer(self.csv_file)
-        for arg in vars(args):
-            writer.writerow([arg, getattr(args, arg)])
-        writer.writerow([''])
-
-        self.writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
-        self.writer.writeheader()
-
-        self.csv_file.flush()
-
-    def writerow(self, row):
-        self.writer.writerow(row)
-        self.csv_file.flush()
-
-    def close(self):
-        self.csv_file.close()
-
-
-logger = logging.getLogger(__name__)
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def simple_accuracy(preds, labels):
-    return (preds == labels).float().mean().item()
-
-
-def save_model(args, model):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
-    torch.save(model_to_save.state_dict(), model_checkpoint)
-    logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
-
-
-def setup(args):
-
-
-
-    from models.vit import VisionTransformer, CONFIGS
-    config = CONFIGS[args.model_type]
-    # print('vit')
-    num_classes = args.classes
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
-    model.load_from(np.load(args.pretrained_dir))
-
-    model.to(args.device)
-    num_params = count_parameters(model)
-
-    logger.info("{}".format(config))
-    logger.info("Training parameters %s", args)
-    logger.info("Total Parameter: \t%2.1fM" % num_params)
-    
-    # output the current model parameters' number per million
-    # print(num_params)
-    return args, model
-
-
-def count_parameters(model):
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return params/1000000
-
-
-def set_seed(args):
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if args.n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
-
-
-def valid(args, model, test_loader, global_step):
-    # Validation!
-    eval_losses = AverageMeter()
-
-    logger.info("***** Running Validation *****")
-    logger.info("  Num steps = %d", len(test_loader))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-
-    model.eval()
-    # all_preds, all_label = [], []
-    num_samples = len(test_loader.dataset)
-    all_preds = torch.zeros(num_samples, dtype=torch.long)
-    all_labels = torch.zeros(num_samples, dtype=torch.long)
-
-    epoch_iterator = tqdm(test_loader)
-    loss_fct = torch.nn.CrossEntropyLoss()
-
-    processed_samples = 0
-    for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
-
-        x, y = batch
-        y = y.to(torch.int64)
-
-        with torch.no_grad():
-            logits = model(x)[0]
-            
-            eval_loss = loss_fct(logits, y)
-            eval_losses.update(eval_loss.item())
-
-            preds = torch.argmax(logits, dim=-1)
-
-        # Another implementation of 
-        batch_size = x.size(0)
-        # processed_samples = step*batch_size
-        all_preds[processed_samples:processed_samples+batch_size] = preds.detach().cpu()
-        all_labels[processed_samples:processed_samples+batch_size] = y.detach().cpu()
-        processed_samples += batch_size
-
-        
-        epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
-
-    # all_preds, all_label = all_preds[0], all_label[0]
-    accuracy = simple_accuracy(all_preds, all_labels)
-    report = classification_report(all_preds, all_labels,zero_division=1)
-    logger.info("\n")
-    logger.info("Validation Results")
-    logger.info("Global Steps: %d" % global_step)
-    logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Valid Accuracy: %2.5f" % accuracy)
-
-    return accuracy, eval_losses.avg,report
-
-# Gradient Test
-# 定义一个字典来存储梯度
-# grad_dict = {}
-
-# def hook_fn(m, grad_in, grad_out):
-#     """钩子函数：在反向传播过程中被调用"""
-#     # 获取模块的名称
-#     module_name = str(m)
-
-#     # 计算梯度的平均值，并将其存储到 grad_dict 中
-#     grad_dict[module_name] = grad_out[0].mean().item()
-
-# # 为每个子模块注册反向钩子
-# def register_hooks(module):
-#     for name, m in module.named_children():
-#         m.register_full_backward_hook(hook_fn)
-#         register_hooks(m)
-
-
-
-def train_per_epoch(args, model, train_loader, step, losses, optimizer, scheduler):
-    
-    num_samples = len(train_loader.dataset)
-
-    batch_size = train_loader.batch_size
-    all_preds = torch.zeros(num_samples, dtype=torch.long)
-    all_labels = torch.zeros(num_samples, dtype=torch.long)
-    loss_fct = torch.nn.CrossEntropyLoss()
-
-    model.train()
-    epoch_iterator = tqdm(train_loader)
-
-    for i, batch in enumerate(epoch_iterator):
-        epoch_iterator.set_description(f"Epoch {step+1} ")
-
-        batch = tuple(t.to(args.device) for t in batch)
-        x, y = batch
-        # print(x)
-        y = y.to(torch.int64)
-        # with autocast():
-        # loss, pred = model(x, y)
-        logits = model(x)[0]
-        # CUDA_LAUNCH_BLOCKING=1.
-        loss = loss_fct(logits, y)
-        # with torch.set_grad_enabled(False):
-        #     loss = loss_fct(logits, y).float()
-        pred = torch.argmax(logits, dim=-1)
-        # loss, pred = model(x, y)  
-
-        train_acc = simple_accuracy(pred.view(-1), y.view(-1))
-
-        # tqdm.write(f'\nloss {loss}')
-        epoch_iterator.set_postfix(acc='%.6f'%train_acc, loss='%.3f' %loss)
-
-
-        # if args.gradient_accumulation_steps > 1:
-        #     loss = loss / args.gradient_accumulation_steps
-
-        loss.backward(retain_graph=True)        # scaler.scale(loss).backward()
-    
-        # if model.gaussian.kernel.grad is not None and model.gaussian.kernel.grad.sum()!=0:
-        #     model.gaussian.kernel = torch.lt(model.gaussian.kernel.grad, 0).float()
-            # model.gaussian.kernel.grad.zero_()
-
-        # if (i+1) % args.gradient_accumulation_steps == 0:
-        losses.update(loss.item())
-        # scaler.unscale_(optimizer)
-        clip_grad.clip_grad_norm_(model.parameters(), 1.0)
-
-        # scaler.step(optimizer)
-        # scaler.update()
-
-        optimizer.step()
-        scheduler.step()
-
-        optimizer.zero_grad()
-
-        ind_sample = i*batch_size
-        samples_size = x.size(0)
-
-        # if x.size(0) != batch_size:
-        #     print('test')
-
-        all_preds[ind_sample:ind_sample+samples_size] = pred.detach().cpu()
-        all_labels[ind_sample:ind_sample+samples_size] = y.detach().cpu()
-    # accuracy = 0
-    accuracy = simple_accuracy(all_preds, all_labels)
-
-
-
-    return accuracy, losses.avg
-
-    # return losses.avg
-
-
-def train(args, model):
-    """ Train the model """
-    if args.local_rank in [-1, 0]:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-
-    # Prepare dataset
-    train_loader, test_loader = get_loader(args)
-    # train_dir = 'Multivariate0.95/'+args.name +'/train.pth'
-    # test_dir = 'Multivariate0.95/'+args.name +'/test.pth'
-    # train_loader = torch.load(train_dir)
-    # test_loader = torch.load(test_dir)
-    # Prepare optimizer and scheduler
-#     optimizer = torch.optim.SGD([{'params': model.gaussian.beta}, {'params': model.parameters()}],
-#         lr=args.learning_rate,
-#         momentum=0.9,
-#         weight_decay=args.weight_decay)
-#     optimizer = torch.optim.SGD([
-#     {'params': model.parameters()},
-#     {'params': model.gaussian.beta, 'lr': 1e-3}
-# ], lr=1e-2, momentum=0.9)
-    # optimizer = torch.optim.SGD(model.parameters(),
-    #                             lr=args.learning_rate,
-    #                             momentum=0.9,
-    #                             weight_decay=args.weight_decay)
-    # optimizer.add_param_group(param_group={'params': model.gaussian.beta})
-    optimizer = torch.optim.SGD(
-    [{'params': model.parameters()}],
-    lr=args.learning_rate,
-    momentum=0.9,
-    weight_decay=args.weight_decay
-)
-   # t_total = args.num_steps
-    t_total = args.num_epochs*len(train_loader) # type: ignore
-
-    if args.decay_type == "cosine":
-        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+import numpy as np
+from collections import OrderedDict
+from PIL import Image
+from glob import glob
+from time import time
+import argparse
+import logging
+import os
+import timm
+
+import wandb_utils
+
+def read_row(line_number):
+    """
+    Get data name and corresponding num_classes.
+    """
+    with open('/home/ld/Time2Image/utils/name_class.txt', "r") as file:
+        for current_line, line in enumerate(file, start=1):
+            if current_line == line_number:
+                name, classes = line.strip().split('\t')
+                return name, int(classes)
+    return None, None  
+
+
+def cleanup():
+    """
+    End DDP training.
+    """
+    dist.destroy_process_group()
+
+
+def requires_grad(model, flag=True):
+    """
+    Set requires_grad flag for all parameters in a model.
+    """
+    for p in model.parameters():
+        p.requires_grad = flag
+
+def create_logger(logging_dir):
+    """
+    Create a logger that writes to a log file and stdout.
+    """
+    if dist.get_rank() == 0:  # real logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+        )
+        logger = logging.getLogger(__name__)
+    else:  # dummy logger (does nothing)
+        logger = logging.getLogger(__name__)
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+def main(args):
+    """
+    Trains a new SiT model.
+    """
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+
+    # Setup DDP:
+    dist.init_process_group("nccl")
+    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+
+    # Setup an experiment folder:
+    if rank == 0:
+        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+        experiment_index = len(glob(f"{args.results_dir}/*"))
+        model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
+        experiment_name = f"{experiment_index:03d}-{model_string_name}-" \
+                        f"{args.path_type}-{args.prediction}-{args.loss_weight}"
+        experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
+        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory created at {experiment_dir}")
+
+        entity = os.environ["ENTITY"]
+        project = os.environ["PROJECT"]
+        if args.wandb:
+            wandb_utils.initialize(args, entity, experiment_name, project)
     else:
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+        logger = create_logger(None)
 
-    # scheduler = CyclicLR(optimizer, base_lr=0.01, max_lr=0.1)
-    # scheduler = OneCycleLR(optimizer, total_steps=t_total, max_lr=args.learning_rate)
+    # Create model:
+    name, num_classes = read_row(args.index)
+    model = timm.create_model(args.model, pretrained=False, num_classes=num_classes)
+    logger.info(f"Dataset {name} with {num_classes} classes")
 
-    current_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # if args.ckpt is not None:
+    #     ckpt_path = args.ckpt
+    #     state_dict = find_model(ckpt_path)
+    #     model.load_state_dict(state_dict["model"])
+    
+    model = DDP(model.to(device), device_ids=[rank])
 
-    file_id = args.name 
-    model_file = f"checkpoints0.95_{args.seed}/{file_id}_{current_timestamp}"
-    logsname = 'logs0.95_'+str(args.seed)
-    log_file = logsname +'/' + file_id +'_'+current_timestamp+'.csv'
+    logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    os.makedirs(model_file)
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
-    csv_logger = CSVLogger(args=args, 
-                           fieldnames=['epoch', 'train_acc', 'test_acc','train_loss','test_loss'], 
-                           filename=log_file)
+    # Setup data:
+    transform = transforms.Compose([
+        transforms.Resize((args.img_size, args.img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
+    dataset = ImageFolder(args.data_path, transform=transform)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(),
+        rank=rank,
+        shuffle=True,
+        seed=args.global_seed
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=local_batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
-    # Train!
-    logger.info("***** Running training *****")
-    logger.info("  Total optimization steps = %d", args.num_steps)
-    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps * (
-                    torch.distributed.get_world_size() if args.local_rank != -1 else 1)) # type: ignore
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    # Prepare models for training:
+    model.train()  # important! This enables embedding dropout for classifier-free guidance
 
-    model.zero_grad()
-    set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
-    losses = AverageMeter()
-    global_step, best_acc = 0, 0
+    # Variables for monitoring/logging purposes:
+    train_steps = 0
+    log_steps = 0
+    running_loss = 0
+    start_time = time()
 
-    # register_hooks(model)
+    # Labels to condition the model with (feel free to change):
 
-    # scaler = GradScaler()
-    for epoch in range(args.num_epochs):
+    logger.info(f"Training for {args.epochs} epochs...")
+    for epoch in range(args.epochs):
+        sampler.set_epoch(epoch)
+        logger.info(f"Beginning epoch {epoch}...")
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
 
-        train_accu, train_loss = train_per_epoch(args, model, train_loader, epoch, losses, optimizer, scheduler)
-        losses.reset()
-        
-        test_accu, test_loss,report = valid(args, model, test_loader, global_step)  # type: ignore
-        tqdm.write(f"accuracy: {test_accu}")
+            loss_dict = model(x)
+            loss = loss_dict["loss"].mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
-        if best_acc < test_accu:
-            best_acc = test_accu
-            checkpoint = {
-                        'accuracy': best_acc,
-                        'report': report,
-                        'v':args.v
+            # Log loss values:
+            running_loss += loss.item()
+            log_steps += 1
+            train_steps += 1
+            if train_steps % args.log_every == 0:
+                # Measure training speed:
+                torch.cuda.synchronize()
+                end_time = time()
+                steps_per_sec = log_steps / (end_time - start_time)
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if args.wandb:
+                    wandb_utils.log(
+                        { "train loss": avg_loss, "train steps/sec": steps_per_sec },
+                        step=train_steps
+                    )
+                # Reset monitoring variables:
+                running_loss = 0
+                log_steps = 0
+                start_time = time()
+
+            # Save SiT checkpoint:
+            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
                     }
-            path = os.path.join(model_file, "checkpoint.pth")
-            torch.save(checkpoint, path)
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                dist.barrier()
+            
 
-        row = {'epoch': str(epoch), 'train_acc': str(train_accu), 'test_acc': str(test_accu),'train_loss':str(train_loss),'test_loss':str(test_loss)}
-        csv_logger.writerow(row)
+    model.eval()  # important! This disables randomized embedding dropout
+    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
-    
+    logger.info("Done!")
+    cleanup()
 
-    logger.info("Best Accuracy: \t%f" % best_acc)
-    logger.info("End Training!")
-    print("Best Accuracy:",best_acc)
-    print(args.name,args.v)
-
-def main():
-
-    parser = argparse.ArgumentParser()
-    # Required parameters
-    parser.add_argument("--name", default='first_trail',
-                        help="Name of this run. Used for monitoring.")
-    parser.add_argument('--v',default=0.95,type=float)
-
-    parser.add_argument("--dropout", default='hd',
-                        help="Dropout type of this run.")
-
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100","imagenet"], default="cifar100",
-                        help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
-                                                 "ViT-L_32", "ViT-H_14"],
-                        default="ViT-B_16",
-                        help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
-                        help="Where to search for pretrained ViT models.")
-    parser.add_argument("--output_dir", default="output", type=str,
-                        help="The output directory where checkpoints will be written.")
-    
-
-    parser.add_argument('--classes',type=int,default=42)
-    parser.add_argument('--index',type=int,default=1)
-
-
-
-
-    parser.add_argument('--device',default='cuda:0')
-    parser.add_argument("--img_size", default=224, type=int,
-                        help="Resolution size")
-    parser.add_argument("--train_batch_size", default=16, type=int,
-                        help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=32, type=int,
-                        help="Total batch size for eval.")
-    parser.add_argument("--eval_every", default=100, type=int,
-                        help="Run prediction on validation set every so many steps."
-                             "Will always run one evaluation at the end of training.")
-
-    parser.add_argument("--learning_rate", default=1e-2, type=float,
-                        help="The initial learning rate for SGD.")
-    parser.add_argument("--weight_decay", default=0, type=float,
-                        help="Weight deay if we apply some.")
-    parser.add_argument("--num_steps", default=200000, type=int,
-                        help="Total number of training steps to perform.")
-    parser.add_argument("--num_epochs", default=200, type=int,
-                        help="Total number of training epochs to perform.")
-    parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
-                        help="How to decay the learning rate.")
-    parser.add_argument("--warmup_steps", default=500, type=int,
-                        help="Step of training to perform learning rate warmup for.")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm.")
-    
-    
-
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="local_rank for distributed training on gpus")
-    parser.add_argument('--seed', type=int, default=42,
-                        help="random seed for initialization")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O2',
-                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-                             "See details at https://nvidia.github.io/apex/amp.html")
-    parser.add_argument('--loss_scale', type=float, default=1,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
-    args = parser.parse_args()
-
-    # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl',    # type: ignore
-                                             timeout=timedelta(minutes=60))  
-        args.n_gpu = 1
-
-    # Overwrite the device
-    # args.device = "cuda:0"
-
-    # Setup logging
-    # If level is `INFO`, then the logs output on terminal
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.ERROR if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
-                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
-
-    # Set seed
-    set_seed(args)
-
-    # Model & Tokenizer Setup
-    # name_list= ['ACSF1', 'Adiac', 'AllGestureWiimoteX', 'AllGestureWiimoteY', 'AllGestureWiimoteZ', 'ArrowHead', 'BME', 'Beef', 'BeetleFly', 'BirdChicken', 'CBF', 
-    #             'Car', 'Chinatown', 'ChlorineConcentration', 'CinCECGTorso', 'Coffee', 'Computers', 'CricketX', 'CricketY', 'CricketZ', 'DiatomSizeReduction', 
-    #             'DistalPhalanxOutlineAgeGroup', 'DistalPhalanxOutlineCorrect',  'ECG200', 'ECG5000', 'ECGFiveDays', 'Earthquakes', 'ElectricDevices', 
-    #             'EthanolLevel', 'FaceAll', 'FaceFour', 'FacesUCR', 'FiftyWords', 'Fish', 'FordA', 'FordB', 'FreezerRegularTrain', 'FreezerSmallTrain', 'GestureMidAirD1', 
-    #             'GestureMidAirD2', 'GestureMidAirD3', 'GunPoint', 'Ham', 'HandOutlines', 'Haptics', 'Herring', 'HouseTwenty', 'InlineSkate', 'InsectWingbeatSound', 'ItalyPowerDemand', 
-    #             'LargeKitchenAppliances', 'Lightning2', 'Lightning7', 'Mallat', 'Meat', 'MedicalImages', 'MelbournePedestrian', 'MiddlePhalanxOutlineAgeGroup', 
-    #             'MiddlePhalanxOutlineCorrect', 'MiddlePhalanxTW', 'MixedShapesRegularTrain', 'MixedShapesSmallTrain', 'MoteStrain', 'NonInvasiveFetalECGThorax1', 
-    #             'NonInvasiveFetalECGThorax2', 'OSULeaf', 'OliveOil', 'PLAID', 'PhalangesOutlinesCorrect', 'Phoneme', 'PickupGestureWiimoteZ', 'PigAirwayPressure', 'PigArtPressure', 
-    #             'PigCVP', 'Plane', 'ProximalPhalanxOutlineAgeGroup', 'ProximalPhalanxOutlineCorrect', 'ProximalPhalanxTW', 'RefrigerationDevices', 'Rock', 'ScreenType', 
-    #             'ShakeGestureWiimoteZ', 'ShapeletSim', 'ShapesAll', 'SmallKitchenAppliances', 'SmoothSubspace', 'SonyAIBORobotSurface1', 'SonyAIBORobotSurface2', 'StarLightCurves', 
-    #             'Strawberry', 'SwedishLeaf', 'Symbols', 'SyntheticControl', 'ToeSegmentation1', 'ToeSegmentation2', 'Trace', 'TwoLeadECG', 'TwoPatterns', 'UMD', 'UWaveGestureLibraryAll', 
-    #             'UWaveGestureLibraryX', 'UWaveGestureLibraryY', 'UWaveGestureLibraryZ', 'Wafer', 'Wine', 'WordSynonyms', 'Worms', 'WormsTwoClass', 'Yoga']
-   
-    name_list = ['ArticularyWordRecognition', 'AtrialFibrillation', 'BasicMotions', 'CharacterTrajectories', 'Cricket', 'DuckDuckGeese', 'EigenWorms', 'Epilepsy', 'EthanolConcentration', 'ERing', 'FaceDetection', 'FingerMovements', 'HandMovementDirection', 'Handwriting', 'Heartbeat', 'InsectWingbeat', 'JapaneseVowels', 'Libras', 'LSST', 'MotorImagery', 'NATOPS', 'PenDigits', 'PEMS-SF', 'PhonemeSpectra', 'RacketSports', 'SelfRegulationSCP1', 'SelfRegulationSCP2', 'SpokenArabicDigits', 'StandWalkJump', 'UWaveGestureLibrary']
-    classes_list=[25, 3, 4, 20, 12, 5, 5, 4, 4, 6, 2, 2, 4, 26, 2, 10, 9, 15, 14, 2, 6, 10, 7, 39, 4, 2, 2, 10, 3, 8]
-    # print(data)
-
-    # name_list = ['CinCECGTorso','ECG200','ECG5000','ECGFiveDays','NonInvasiveFetalECGThorax1','NonInvasiveFetalECGThorax2','TwoLeadECG']
-    # classes_list = [4,2,5,2,42,42,2]
-    # args.index=32
-    args.name = name_list[args.index]
-    args.classes = classes_list[args.index]
-    args, model = setup(args)
-
-    print(args.name,args.classes,args.v)
-    # train_loader, test_loader = get_loader(args)
-    # print(train_loader)
-    # Training
-    train(args, model)
-    
-    # train_loader, test_loader = get_loader(args)
-    # torch.save(train_loader,'train.pth')
-    # torch.save(test_loader,'test.pth')
-    # train_loader, test_loader = get_loader(args)
-    # dir_save = 'Multivariate0.99/'+args.name
-    # os.makedirs(dir_save, exist_ok=True)
-    # train_save_path = os.path.join(dir_save, "train.pth")
-    # test_save_path = os.path.join(dir_save, "test.pth")
-    # torch.save(train_loader,train_save_path)
-    # torch.save(test_loader,test_save_path)
 if __name__ == "__main__":
-    main()
+    # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--model", type=str,  choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
+                                                 "ViT-L_32", "ViT-H_14",'ResNet'], default="ViT-B_16")
+    parser.add_argument("--image-size", type=int, choices=[256, 384, 512], default=256)
+    parser.add_argument("--index", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--wandb", action="store_true")
+    args = parser.parse_args()
+    main(args)
