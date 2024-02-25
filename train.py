@@ -18,6 +18,9 @@ import os
 import timm
 from tqdm import tqdm
 import wandb_utils
+from models.vit import VisionTransformer, CONFIGS
+import numpy as np
+from torch.nn.utils import clip_grad
 
 def read_row(line_number):
     """
@@ -96,7 +99,7 @@ def main(args):
     # Setup an experiment folder:
     os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_index = len(glob(f"{args.results_dir}/*"))
-    model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
+    model_string_name = args.model_type.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
     experiment_name = f"{name}-{experiment_index:03d}-{model_string_name}-std_{str(args.std)}" 
     experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
     checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
@@ -111,18 +114,22 @@ def main(args):
  
 
     # Create model:
-    model = timm.create_model(args.model, pretrained=False, num_classes=num_classes)
-    logger.info(f"Dataset {name} with {num_classes} classes")
+    model_config = CONFIGS[args.model_type]
+    model = VisionTransformer(model_config, args.image_size, zero_head=True, num_classes=num_classes)
+    model.load_from(np.load(args.pretrained_dir))
 
-    checkpoint_path = f'ckp/{args.model}/pytorch_model.bin'
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')  
+    # model = timm.create_model(args.model, pretrained=False, num_classes=num_classes)
+    # logger.info(f"Dataset {name} with {num_classes} classes")
 
-    # Remove the head-related keys from the checkpoint's state_dict
-    for key in ['head.weight', 'head.bias']:
-        if key in checkpoint:
-            del checkpoint[key]
-    # Load the state dict, and set strict=False to skip the non-matching keys
-    model.load_state_dict(checkpoint, strict=False)
+    # checkpoint_path = f'ckp/{args.model}/pytorch_model.bin'
+    # checkpoint = torch.load(checkpoint_path, map_location='cpu')  
+
+    # # Remove the head-related keys from the checkpoint's state_dict
+    # for key in ['head.weight', 'head.bias']:
+    #     if key in checkpoint:
+    #         del checkpoint[key]
+    # # Load the state dict, and set strict=False to skip the non-matching keys
+    # model.load_state_dict(checkpoint, strict=False)
 
     model = model.to(device)
 
@@ -146,13 +153,13 @@ def main(args):
     # load from dictionary
     # train_data_dir = os.path.join(args.data_path,name,'train')
     # test_data_dir = os.path.join(args.data_path,name,'test')
-    trainset = ImageFolder('ECG/train', transform=transform_train)
-    testset = ImageFolder('ECG/test', transform=transform_test)
+    # trainset = ImageFolder(train_data_dir, transform=transform_train)
+    # testset = ImageFolder(test_data_dir, transform=transform_test)
 
     # load from .tsv file
-    # train_x, train_y, test_x, test_y = get_data(args)
-    # trainset = ImageDataset(train_x, train_y, transform=transform_train)
-    # testset = ImageDataset(test_x, test_y, transform=transform_test)
+    train_x, train_y, test_x, test_y = get_data(args)
+    trainset = ImageDataset(train_x, train_y, transform=transform_train)
+    testset = ImageDataset(test_x, test_y, transform=transform_test)
 
 
 
@@ -190,13 +197,12 @@ def main(args):
     # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
-    running_loss = 0
-    start_time = time()
     criterion = torch.nn.CrossEntropyLoss()
 
     # Labels to condition the model with (feel free to change):
 
     logger.info(f"Training for {args.epochs} epochs...")
+    best_accu = 0
     for epoch in range(args.epochs):
         if not args.single_gpu:
             train_sampler.set_epoch(epoch)  # Only call set_epoch when using DistributedSampler
@@ -209,12 +215,13 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
 
-            logits = model(x)
+            logits = model(x)[0]
             loss = criterion(logits, y)
             loss.backward()
             opt.step()
             scheduler.step()
             opt.zero_grad()
+            clip_grad.clip_grad_norm_(model.parameters(), 1.0)
 
             # Log loss values:
             log_steps += 1
@@ -233,9 +240,9 @@ def main(args):
                     step=train_steps
                 )
             # Reset monitoring variables:
-            running_loss = 0
-            log_steps = 0
-            start_time = time()
+            # running_loss = 0
+            # log_steps = 0
+            # start_time = time()
 
             # Save checkpoint:
             # if train_steps % args.ckpt_every == 0 and train_steps > 0:
@@ -257,7 +264,7 @@ def main(args):
             for x, y in test_loader:
                 x = x.to(device)
                 y = y.to(device)
-                logits = model(x)
+                logits = model(x)[0]
                 test_loss += criterion(logits, y).item()  # Sum up batch loss
                 pred = logits.argmax(dim=1, keepdim=True)  # Get the index of the max log-probability
                 correct += pred.eq(y.view_as(pred)).sum().item()
@@ -266,6 +273,8 @@ def main(args):
         test_loss = torch.tensor(test_loss, device=device) / i
         correct = torch.tensor(correct, device=device)
         test_accuracy = 100. * correct / len(test_loader.dataset)
+        if test_accuracy > best_accu:
+            best_accu = test_accuracy
         logger.info(f"Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({test_accuracy:.2f}%)")
         if args.wandb:
             wandb_utils.log(
@@ -274,28 +283,34 @@ def main(args):
             )
         
 
-    model.eval()  
-    logger.info("Done!")
+    logger.info(name + ' (std = ' + str(args.std) + ") best accu: " + str(best_accu.item()))
 
 
 if __name__ == "__main__":
-    # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, default='UCRArchive_2018')
     parser.add_argument("--name-class-path", type=str, default='utils/name_class.txt')
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, default="vit_base_patch16_224")
+
+    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
+                                                 "ViT-L_32", "ViT-H_14"],
+                        default="ViT-B_16",
+                        help="Which variant to use.")
     parser.add_argument("--image-size", type=int, choices=[224, 384, 512], default=224)
     parser.add_argument("--patch-size", type=int, choices=[14, 16, 32], default=16)
     parser.add_argument("--index", type=int, default=1)
+    parser.add_argument("--std", type=float, default=1)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
+                        help="Where to search for pretrained ViT models.")
+    
+
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--global-batch-size", type=int, default=10)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--std", type=float, default=1)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt-every", type=int, default=50000)
     parser.add_argument("--single-gpu", default=True, help="Run the training on a single GPU.")
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()

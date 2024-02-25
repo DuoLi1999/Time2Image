@@ -4,3 +4,7 @@ utils/mat_pos.json
 utils/radius.json
 run.sh
 train.sh
+data-img_size224-patch_size16
+checkpoint/ViT-B_16.npz
+ckp/
+train copy.py
