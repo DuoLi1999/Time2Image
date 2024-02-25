@@ -65,7 +65,11 @@ def get_new_seq(data, size=196):
     normalized_series = (seq_new - seq_new.min()) / (seq_new.max() - seq_new.min())
     normalized_series = 2 * normalized_series - 1
 
-    return normalized_series
+    mu = np.mean(seq_new)
+    sigma = np.sqrt(np.var(seq_new))
+    Z = (seq_new - mu) / sigma
+    Z -= Z.mean()
+    return seq_new
 
 def resize_batch_time_series(batch_data, size=196):
     '''
@@ -112,36 +116,41 @@ def main(args):
     data_train, label_train= read_tsv(data_dir[0], num_classes)
     data_test, label_test  = read_tsv(data_dir[1], num_classes)
 
-    train_dir = os.path.join(args.results_dir, name, 'train')
-    test_dir = os.path.join(args.results_dir, name, 'test')
+    train_dir = os.path.join(args.results_dir +'-img_size' + str(args.image_size)+ '-patch_size' + str(args.patch_size), name, 'train')
+    test_dir = os.path.join(args.results_dir +'-img_size' + str(args.image_size)+ '-patch_size' + str(args.patch_size), name, 'test')
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     for i in range(num_classes):
         os.makedirs(os.path.join(train_dir, str(i)), exist_ok=True)
         os.makedirs(os.path.join(test_dir, str(i)), exist_ok=True)
 
-    gaussian_mat = get_gmat(config,m=0, n=0, std=1)
+    gaussian_mat = get_gmat(config,m=0, n=0, std=args.std)
     data_train = expand_matrices(resize_batch_time_series(data_train, config.seq_length), config) * gaussian_mat * 255
     data_test = expand_matrices(resize_batch_time_series(data_test, config.seq_length), config) * gaussian_mat * 255
-
+    
+    print('**********************************************************************')
     for i in tqdm(range(len(data_train))):
-        img = Image.fromarray((data_train[i]).astype(np.uint8), mode='L')
-        img.save(os.path.join(train_dir, str(label_train[i]))+'/'+str(i)+'.JPEG')
-    print('Processing ' + name +' training dataset done!')    
+        img = Image.fromarray(data_train[i].astype(np.uint8), mode='L')
+        img = img.convert('RGB')
+        img.save(os.path.join(train_dir, str(label_train[i]), f'{i}.JPEG'))
+    print(f'Processing {name} training dataset done!')
+
     for i in tqdm(range(len(data_test))):
-        img = Image.fromarray((data_test[i]).astype(np.uint8), mode='L')
-        img.save(os.path.join(test_dir, str(label_test[i]))+'/'+str(i)+'.JPEG')    
-    print('Processing ' + name +' testing dataset done!')    
+        img = Image.fromarray(data_test[i].astype(np.uint8), mode='L')
+        img = img.convert('RGB')
+        img.save(os.path.join(test_dir, str(label_test[i]), f'{i}.JPEG'))
+    print(f'Processing {name} testing dataset done!')
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--name-class-path", type=str, default='utils/name_class.txt')
     parser.add_argument("--data-path", type=str, default='UCRArchive_2018')
-    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--results-dir", type=str, default="data")
     parser.add_argument("--image-size", type=int, choices=[224, 384, 512], default=224)
     parser.add_argument("--patch-size", type=int, choices=[14, 16, 32], default=16)
     parser.add_argument("--index", type=int, default=1)
+    parser.add_argument("--std", type=float, default=1)
 
     args = parser.parse_args()
     main(args)
