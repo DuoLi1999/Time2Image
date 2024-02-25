@@ -85,7 +85,7 @@ def create_logger(logging_dir, args):
 
 def main(args):
     """
-    Trains a new SiT model.
+    Trains a new model.
     """
     name, num_classes = read_row(args.index)
 
@@ -99,7 +99,7 @@ def main(args):
     # Setup an experiment folder:
     os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_index = len(glob(f"{args.results_dir}/*"))
-    model_string_name = args.model_type.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
+    model_string_name = args.model_type.replace("/", "-")  
     experiment_name = f"{name}-{experiment_index:03d}-{model_string_name}-std_{str(args.std)}" 
     experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
     checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
