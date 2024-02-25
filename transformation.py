@@ -123,19 +123,21 @@ def main(args):
     for i in range(num_classes):
         os.makedirs(os.path.join(train_dir, str(i)), exist_ok=True)
         os.makedirs(os.path.join(test_dir, str(i)), exist_ok=True)
-
+        
     gaussian_mat = get_gmat(config,m=0, n=0, std=args.std)
-    data_train = expand_matrices(resize_batch_time_series(data_train, config.seq_length), config) * gaussian_mat * 255
-    data_test = expand_matrices(resize_batch_time_series(data_test, config.seq_length), config) * gaussian_mat * 255
+    data_train = expand_matrices(resize_batch_time_series(data_train, config.seq_length), config) * gaussian_mat
+    data_test = expand_matrices(resize_batch_time_series(data_test, config.seq_length), config) * gaussian_mat  
     
     print('**********************************************************************')
     for i in tqdm(range(len(data_train))):
+        data_train[i] = (data_train[i] - np.min(data_train[i])) / (np.max(data_train[i]) - np.min(data_train[i])) * 255
         img = Image.fromarray(data_train[i].astype(np.uint8), mode='L')
         img = img.convert('RGB')
         img.save(os.path.join(train_dir, str(label_train[i]), f'{i}.JPEG'))
     print(f'Processing {name} training dataset done!')
 
     for i in tqdm(range(len(data_test))):
+        data_test[i] = (data_test[i] - np.min(data_test[i])) / (np.max(data_test[i]) - np.min(data_test[i])) * 255
         img = Image.fromarray(data_test[i].astype(np.uint8), mode='L')
         img = img.convert('RGB')
         img.save(os.path.join(test_dir, str(label_test[i]), f'{i}.JPEG'))
